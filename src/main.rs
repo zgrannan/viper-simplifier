@@ -9,6 +9,8 @@ use std::fs;
 use std::fmt::Display;
 use std::borrow::Cow;
 use std::collections::VecDeque;
+use std::collections::HashSet;
+use std::mem::replace;
 
 
 struct Replacement<'a> {
@@ -38,14 +40,30 @@ fn get_captured_node<'a>(query: &'a Query, m: &'a QueryMatch<'a, 'a>, name: &str
 
 fn main() {
     let mut source = fs::read_to_string("./test.vpr").unwrap();
+
     // let mut source = fs::read_to_string("../tree-sitter-viper/test.vpr").unwrap();
     let mut i = 0;
     loop {
         let mut buffer = String::new();
         let source_str = source.as_str();
         let tree = parse_viper_source(source_str);
+        let labels = get_labels(&tree, source_str);
+        eprintln!("Labels: {:?}", labels);
+        let mut replacements = Vec::new();
+        for (node, label_text) in labels.iter() {
+            if !is_label_used(&tree, label_text, source_str) {
+                eprintln!("Unused label {}", label_text);
+                replacements.push(
+                    Replacement {
+                        start: node.start_byte(),
+                        end: node.end_byte(),
+                        replacement: Cow::Borrowed("")
+                    }
+                );
+            }
+        }
 
-        let mut replacements = get_replacements_for(&tree, simplify_and(), source_str, |query, m| {
+        replacements.append(&mut get_replacements_for(&tree, simplify_and(), source_str, |query, m| {
             let if_clause = get_captured_node(query, &m, "binexpr");
             let var = get_captured_node(query, &m, "lhs");
             Some(Replacement {
@@ -53,9 +71,9 @@ fn main() {
                 end: if_clause.end_byte(),
                 replacement: Cow::Borrowed(var.utf8_text(source_str.as_bytes()).unwrap())
             })
-        });
+        }));
 
-        let mut if_replacements = get_replacements_for(&tree, simplify_ifs(), source_str, |query, m| {
+        replacements.append(&mut get_replacements_for(&tree, simplify_ifs(), source_str, |query, m| {
             let condition_node = get_captured_node(query, &m, "var1");
             let condition = condition_node.utf8_text(source_str.as_bytes()).unwrap();
             let second_condition = get_captured_node(query, &m, "var2").utf8_text(source_str.as_bytes()).unwrap();
@@ -77,9 +95,8 @@ fn main() {
                 end: second_if.end_byte(),
                 replacement: Cow::Owned(replacement),
             })
-        });
+        }));
 
-        replacements.append(&mut if_replacements);
         sort_replacements(&mut replacements);
         let replacements = remove_overlapping_replacements(replacements);
         validate_replacements(&replacements);
@@ -333,6 +350,42 @@ fn sort_replacements(replacements: &mut Vec<Replacement>) {
     });
 }
 
+fn get_labels<'a>(
+    tree: &'a Tree,
+    source_code: &'a str
+) -> HashSet<(Node<'a>, &'a str)> {
+    let mut query_cursor = QueryCursor::new();
+    let query_string = "(stmt (label (_) @ident))";
+    let ts_query = Query::new(tree.language(), query_string).unwrap_or_else(|err|
+        panic!("Couldn't parse query: {}", err)
+    );
+    let matches = query_cursor.matches(&ts_query, tree.root_node(), source_code.as_bytes());
+    matches.map(|m| {
+        let ident_node = m.captures.iter().find(|c| c.index == 0).unwrap().node;
+        let label_text = ident_node.utf8_text(source_code.as_bytes()).unwrap();
+        (ident_node.parent().unwrap(), label_text)
+    }).collect()
+}
+
+fn is_label_used<'a>(
+    tree: &'a Tree,
+    label: &'a str,
+    source_code: &'a str
+) -> bool {
+    let mut query_cursor = QueryCursor::new();
+    let query_string = format!("
+        (goto_stmt target: (ident) @lbl (#eq? @lbl \"{label}\"))
+        (old_expr label: (ident) @lbl (#eq? @lbl \"{label}\"))");
+    let ts_query = Query::new(tree.language(), query_string.as_str()).unwrap_or_else(|err|
+        panic!("Couldn't parse query {}: {}", query_string, err)
+    );
+    let matches = query_cursor
+        .matches(&ts_query, tree.root_node(), source_code.as_bytes())
+        .collect::<Vec<_>>();
+    eprintln!("Label {label} has {} matches", &matches.len());
+    matches.len() > 0
+}
+
 fn get_replacements_for<'a, 'b: 'a, F>(
     tree: &'a Tree,
     query: QueryExpr<'b>,
@@ -346,7 +399,6 @@ fn get_replacements_for<'a, 'b: 'a, F>(
     let ts_query = Query::new(tree.language(), query_string.as_str()).unwrap_or_else(|err|
         panic!("Couldn't parse query: {}", err)
     );
-    ts_query.pattern_count();
     // eprintln!("Query Captures: {}", ts_query.capture_names().join(", "));
     let mut query_cursor = QueryCursor::new();
     let matches = query_cursor.matches(&ts_query, tree.root_node(), source_code.as_bytes());
