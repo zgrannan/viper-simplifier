@@ -5,6 +5,7 @@ use tree_sitter::Parser;
 use tree_sitter::Query;
 use tree_sitter::QueryCursor;
 use tree_sitter::QueryMatch;
+use tree_sitter::QueryMatches;
 use tree_sitter::Tree;
 use tree_sitter::Node;
 use std::fs;
@@ -12,7 +13,10 @@ use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::collections::HashSet;
 use std::env;
+use std::mem::replace;
 use std::os::unix::ffi::OsStrExt;
+use std::collections::HashMap;
+use std::path::Iter;
 
 
 struct Replacement<'a> {
@@ -51,7 +55,7 @@ fn get_captured_node_text<'a>(query: &'a Query, m: &'a QueryMatch<'a, 'a>, name:
 }
 
 fn get_captured_node<'a>(query: &'a Query, m: &'a QueryMatch<'a, 'a>, name: &str) -> Node<'a> {
-    get_captured_nodes(query, m, name)[0]
+    get_captured_nodes(query, m, name).next().unwrap()
 }
 
 fn get_captured_node_with_text<'a>(query: &'a Query, m: &'a QueryMatch, name: &str, source_code: &'a str) -> (Node<'a>, &'a str) {
@@ -59,9 +63,9 @@ fn get_captured_node_with_text<'a>(query: &'a Query, m: &'a QueryMatch, name: &s
     (node, node_text(node, source_code))
 }
 
-fn get_captured_nodes<'a>(query: &'a Query, m: &'a QueryMatch<'a, 'a>, name: &str) -> Vec<Node<'a>> {
+fn get_captured_nodes<'a>(query: &'a Query, m: &'a QueryMatch<'a, 'a>, name: &str) -> impl Iterator<Item = Node<'a>> {
     let index = query.capture_index_for_name(name).unwrap();
-    m.captures.iter().filter(|c| c.index == index).map(|c| c.node).collect::<Vec<_>>()
+    m.captures.iter().filter(move |c| c.index == index).map(|c| c.node)
 }
 
 fn node_text<'a>(node: Node, source_code: &'a str) -> &'a str {
@@ -71,6 +75,78 @@ fn node_text<'a>(node: Node, source_code: &'a str) -> &'a str {
 fn is_constant<'a>(node: Node<'a>, source_code: &'a str) -> bool {
     let text = node_text(node, source_code);
     text == "true" || text == "false"
+}
+
+fn matching_ident_query(ident: &str) -> Query {
+    viper_query(&format!("((ident) @ident (#eq? @ident \"{}\"))", ident))
+}
+
+fn viper_query(query: &str) -> Query {
+    Query::new(tree_sitter_viper::viper(), query).unwrap_or_else(|err|
+        panic!("Couldn't parse query: {}", err)
+    )
+}
+
+
+fn constant_replacements<'a>(node: Node<'a>, dict: &HashMap<&'a str, &'a str>, source_code: &'a str) -> Vec<Replacement<'a>> {
+    let mut replacements = Vec::new();
+    for (ident, rep) in dict.iter() {
+        let query = matching_ident_query(ident);
+        let mut qc = QueryCursor::new();
+        for m in qc.matches(&query, node, source_code.as_bytes()) {
+            let ident_node = get_captured_node(&query, &m, "ident");
+            let rep = Replacement {
+                start: ident_node.start_byte(),
+                end: ident_node.end_byte(),
+                replacement: Cow::Borrowed(rep)
+            };
+            replacements.push(rep);
+        }
+    }
+    replacements
+}
+
+fn constant_propagation<'a>(method: Node<'a>, source_code: &'a str) -> Vec<Replacement<'a>> {
+    let mut replacements = Vec::new();
+    let body = method.child_by_field_name("body");
+    if body.is_none() {
+        return replacements
+    }
+    let mut curr_stmt_option = body.unwrap().named_child(0);
+    let mut dict: HashMap<&'a str, &'a str> = HashMap::new();
+    while curr_stmt_option.is_some() {
+        let curr_stmt = curr_stmt_option.unwrap();
+        curr_stmt_option = curr_stmt.next_named_sibling();
+        if curr_stmt.kind() == "comment" {
+            continue;
+        }
+        if curr_stmt.child(0).unwrap().kind() == "var_decl" {
+            let decl = curr_stmt.child(0).unwrap();
+            let ident = decl.child_by_field_name("ident").unwrap();
+            let expr_option = decl.child_by_field_name("expr");
+            if let Some(expr) = expr_option {
+                replacements.append(&mut constant_replacements(expr, &dict, source_code));
+                if is_constant(expr, source_code) {
+                    dict.insert(node_text(ident, source_code), node_text(expr, source_code));
+                }
+            };
+        } else if curr_stmt.child(0).unwrap().kind() == "assign_stmt" {
+            let assign = curr_stmt.child(0).unwrap();
+            let expr = assign.child_by_field_name("expr").unwrap();
+            replacements.append(&mut constant_replacements(expr, &dict, source_code));
+            if assign.child_by_field_name("target").unwrap().child(0).unwrap().kind() == "ident" {
+                let ident_text = node_text(assign.child_by_field_name("target").unwrap(), source_code);
+                if is_constant(expr, source_code) {
+                    dict.insert(ident_text, node_text(expr, source_code));
+                } else {
+                    dict.remove(ident_text);
+                }
+            }
+        } else {
+            replacements.append(&mut constant_replacements(curr_stmt, &dict, source_code));
+        }
+    }
+    return replacements;
 }
 
 fn get_simplifiable_assigns<'a>(tree: &'a Tree, source_code: &'a str) -> Vec<Replacement<'a>> {
@@ -87,10 +163,10 @@ fn get_simplifiable_assigns<'a>(tree: &'a Tree, source_code: &'a str) -> Vec<Rep
         let ident_text = get_captured_node_text(&decls_ts_query, &m, "ident", source_code);
         let typ_text = get_captured_node_text(&decls_ts_query, &m, "typ", source_code);
         let mut next_sibling_option = decl.next_sibling();
-        let matching_ident_query = format!("((ident) @ident (#eq? @ident \"{}\"))", ident_text);
+        let ident_query = matching_ident_query(ident_text);
         while next_sibling_option.is_some() {
             let next_sibling = next_sibling_option.unwrap();
-            if has_matches(next_sibling, &matching_ident_query, source_code) {
+            if has_matches(next_sibling, &ident_query, source_code) {
                 if next_sibling.child(0).unwrap().kind() == "assign_stmt" {
                     let assign_stmt = next_sibling.child(0).unwrap();
                     let target = assign_stmt.child_by_field_name("target").unwrap();
@@ -99,7 +175,7 @@ fn get_simplifiable_assigns<'a>(tree: &'a Tree, source_code: &'a str) -> Vec<Rep
                         break;
                     }
                     let expr_text = node_text(expr, source_code);
-                    if node_text(target, source_code) == ident_text && !has_matches(expr, &matching_ident_query, source_code) {
+                    if node_text(target, source_code) == ident_text && !has_matches(expr, &ident_query, source_code) {
                         let rep1 = Replacement {
                             start: decl.start_byte(),
                             end: decl.end_byte(),
@@ -143,6 +219,27 @@ fn run_query(source: &str, query: &str) {
         }
     }
 }
+
+const SIMPLIFY_ANDS_QUERY: &str =
+    "(expr
+        (bin_expr
+            lhs: (expr (ident) @lhs)
+            operator: \"&&\"
+            rhs: [(expr (expr (ident) @rhs)) (expr (ident) @rhs) ]
+        )
+        @binexpr
+        (#eq? @lhs @rhs)
+    )";
+
+
+const SIMPLIFY_IFS_QUERY: &str = "
+    (
+        (stmt (if_stmt condition: (expr (ident) @var1) then_clause: [(stmt (inhale_stmt (_)) ) (stmt (exhale_stmt (_)) ) ]*  !else_clause) @if1)
+        .
+        (stmt (if_stmt condition: (expr (ident) @var2) then_clause: [(stmt (inhale_stmt (_)) ) (stmt (exhale_stmt (_)) ) ]*  !else_clause) @if2)
+        (#eq? @var1 @var2)
+    )
+";
 
 fn main() {
 
@@ -192,7 +289,14 @@ fn main() {
         }
         replacements.append(&mut get_simplifiable_assigns(&tree, source_str));
 
-        replacements.append(&mut get_replacements_for(&tree, simplify_and(), source_str, |query, m| {
+        let methods_query = viper_query("(method) @method");
+        let mut qc = QueryCursor::new();
+        qc.matches(&methods_query, tree.root_node(), source_str.as_bytes()).for_each(|m| {
+            let method = m.captures.iter().find(|c| c.index == 0).unwrap().node;
+            replacements.append(&mut constant_propagation(method, source_str));
+        });
+
+        replacements.append(&mut get_replacements_for(&tree, SIMPLIFY_ANDS_QUERY, source_str, |query, m| {
             let if_clause = get_captured_node(query, &m, "binexpr");
             let var = get_captured_node(query, &m, "lhs");
             Some(Replacement {
@@ -202,7 +306,7 @@ fn main() {
             })
         }));
 
-        replacements.append(&mut get_replacements_for(&tree, simplify_ifs(), source_str, |query, m| {
+        replacements.append(&mut get_replacements_for(&tree, SIMPLIFY_IFS_QUERY, source_str, |query, m| {
             let condition_node = get_captured_node(query, &m, "var1");
             let condition = condition_node.utf8_text(source_str.as_bytes()).unwrap();
             let second_condition = get_captured_node(query, &m, "var2").utf8_text(source_str.as_bytes()).unwrap();
@@ -236,7 +340,7 @@ fn main() {
             eprintln!("Iteration {i} (code size: {}): Made {} replacements", source_str.len(), replacements.len());
         }
         for node in replacements {
-            // eprintln!("Replacing {} with {}", &source_str[node.start..node.end], node.replacement);
+            eprintln!("Replacing {} with {}", &source_str[node.start..node.end], node.replacement);
             buffer.push_str(&source_str[last_byte..node.start]);
             buffer.push_str(node.replacement.as_ref());
             last_byte = node.end;
@@ -305,17 +409,14 @@ fn get_labels<'a>(
 
 fn has_matches<'a>(
     node: Node,
-    query: &'a str,
+    query: &'a Query,
     source_code: &'a str
 ) -> bool {
     let mut query_cursor = QueryCursor::new();
-    let ts_query = Query::new(node.language(), query).unwrap_or_else(|err|
-        panic!("Couldn't parse query {}: {}", query, err)
-    );
-    let matches = query_cursor
-        .matches(&ts_query, node, source_code.as_bytes())
-        .collect::<Vec<_>>();
-    matches.len() > 0
+    query_cursor
+        .matches(&query, node, source_code.as_bytes())
+        .next()
+        .is_some()
 }
 
 fn is_label_used<'a>(
@@ -323,90 +424,26 @@ fn is_label_used<'a>(
     label: &'a str,
     source_code: &'a str
 ) -> bool {
-    let query_string = format!("
+    let query_string = viper_query(&format!("
         (goto_stmt target: (ident) @lbl (#eq? @lbl \"{label}\"))
-        (old_expr label: (ident) @lbl (#eq? @lbl \"{label}\"))");
+        (old_expr label: (ident) @lbl (#eq? @lbl \"{label}\"))"));
     has_matches(tree.root_node(), &query_string, source_code)
 }
 
 fn get_replacements_for<'a, 'b: 'a, F>(
     tree: &'a Tree,
-    query: QueryExpr<'b>,
+    query: &'a str,
     source_code: &'a str,
     f: F
 ) ->  Vec<Replacement<'a>>
   where F: Fn(&Query, QueryMatch)  -> Option<Replacement<'a>>
 {
-    let query_string = format!("{}", query);
-    // eprintln!("Query string: {}", query_string);
-    let ts_query = Query::new(tree.language(), query_string.as_str()).unwrap_or_else(|err|
-        panic!("Couldn't parse query: {}", err)
-    );
-    // eprintln!("Query Captures: {}", ts_query.capture_names().join(", "));
+    let query = viper_query(query);
     let mut query_cursor = QueryCursor::new();
-    let matches = query_cursor.matches(&ts_query, tree.root_node(), source_code.as_bytes());
+    let matches = query_cursor.matches(&query, tree.root_node(), source_code.as_bytes());
     matches.map(|m| {
-        f(&ts_query, m)
+        f(&query, m)
     }).filter(|r| r.is_some()).map(|r| r.unwrap()).collect()
-}
-
-const RHS_IDENT: &'static QueryExpr<'static> = &QueryExpr::ident("rhs");
-
-fn simplify_ifs() -> QueryExpr<'static> {
-    let side_effect_free_body =
-        QueryExpr::star(
-            QueryExpr::Choice(
-                vec![
-                    Cow::Owned(QueryExpr::Inhale(
-                        Box::new(QueryExpr::Wildcard),
-                        QueryMeta::empty()
-                    )),
-                    Cow::Owned(QueryExpr::Exhale(
-                        Box::new(QueryExpr::Wildcard),
-                        QueryMeta::empty()
-                    )),
-                ]
-            ),
-        );
-    QueryExpr::Seq(
-        SeqQueryExpr {
-            fst: Box::new(QueryExpr::if_stmt(
-                QueryExpr::ident("var1"),
-                side_effect_free_body.clone(),
-                false,
-                QueryMeta { capture: Some("if1"), predicate: None }
-            )),
-            snd: Box::new(QueryExpr::if_stmt(
-                QueryExpr::ident("var2"),
-                side_effect_free_body,
-                false,
-                QueryMeta { capture: Some("if2"), predicate: None }
-            )),
-        },
-        QueryMeta {
-            capture: None,
-            predicate: Some(QueryPredicate::Eq(
-                PredicateExpr::Capture("var1"),
-                PredicateExpr::Capture("var2")
-            ))
-        }
-    )
-}
-
-fn simplify_and() -> QueryExpr<'static> {
-    QueryExpr::and(
-        QueryExpr::ident("lhs"),
-        QueryExpr::maybe_in_parens(
-            RHS_IDENT
-        ),
-        QueryMeta {
-            capture: Some("binexpr"),
-            predicate: Some(QueryPredicate::Eq(
-                PredicateExpr::Capture("lhs"),
-                PredicateExpr::Capture("rhs")
-            ))
-        }
-    )
 }
 
 fn parse_rust_source(source_code: &str) -> Tree {
