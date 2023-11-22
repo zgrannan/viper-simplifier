@@ -1,11 +1,8 @@
 mod tree_sitter_viper;
-mod query_expr;
-use query_expr::*;
 use tree_sitter::Parser;
 use tree_sitter::Query;
 use tree_sitter::QueryCursor;
 use tree_sitter::QueryMatch;
-use tree_sitter::QueryMatches;
 use tree_sitter::Tree;
 use tree_sitter::Node;
 use std::fs;
@@ -13,10 +10,8 @@ use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::collections::HashSet;
 use std::env;
-use std::mem::replace;
-use std::os::unix::ffi::OsStrExt;
 use std::collections::HashMap;
-use std::path::Iter;
+use std::mem::replace;
 
 
 struct Replacement<'a> {
@@ -25,24 +20,13 @@ struct Replacement<'a> {
     replacement: Cow<'a, str>
 }
 
-impl <'a> Replacement<'a> {
-    fn new(start: usize, end: usize, replacement: Cow<'a, str>) -> Replacement<'a> {
-        assert!(start <= end);
-        Replacement {
-            start,
-            end,
-            replacement
-        }
-    }
-}
-
 fn get_body_of_braces<'a> (node: Node<'a>, source_str: &'a str) -> String {
     let mut buf = String::new();
     let mut node = node;
-    while(node.next_named_sibling().is_some()) {
+    while node.next_named_sibling().is_some() {
         node = node.next_named_sibling().unwrap();
         buf.push_str(node.utf8_text(source_str.as_bytes()).unwrap());
-        if(node.next_named_sibling().is_some()){
+        if node.next_named_sibling().is_some() {
             buf.push_str("\n");
         }
     }
@@ -56,11 +40,6 @@ fn get_captured_node_text<'a, 'b>(query: &'a Query, m: &'a QueryMatch<'a, 'a>, n
 
 fn get_captured_node<'a>(query: &'a Query, m: &'a QueryMatch<'a, 'a>, name: &str) -> Node<'a> {
     get_captured_nodes(query, m, name).next().unwrap()
-}
-
-fn get_captured_node_with_text<'a>(query: &'a Query, m: &'a QueryMatch, name: &str, source_code: &'a str) -> (Node<'a>, &'a str) {
-    let node = get_captured_node(query, m, name);
-    (node, node_text(node, source_code))
 }
 
 fn get_captured_nodes<'a>(query: &'a Query, m: &'a QueryMatch<'a, 'a>, name: &str) -> impl Iterator<Item = Node<'a>> {
@@ -198,28 +177,6 @@ fn get_simplifiable_assigns<'a>(tree: &'a Tree, source_code: &'a str) -> Vec<Rep
     return replacements
 }
 
-fn run_query(source: &str, query: &str) {
-    let tree = parse_rust_source(source);
-    let mut qc = QueryCursor::new();
-    let ts_query = Query::new(tree.language(), query).unwrap_or_else(|err|
-        panic!("Couldn't parse query: {}", err)
-    );
-    let matches = qc
-        .matches(&ts_query, tree.root_node(), source.as_bytes())
-        .collect::<Vec<_>>();
-    assert!(ts_query.pattern_count() == 1, "Expected one pattern");
-    for m in matches.iter() {
-        assert!(m.pattern_index == 0, "Expected pattern index to be 0");
-        eprintln!("----");
-        for capture in m.captures.iter() {
-            eprintln!("Capture {} for {}",
-                capture.node.utf8_text(source.as_bytes()).unwrap(),
-                ts_query.capture_names()[capture.index as usize]
-            );
-        }
-    }
-}
-
 const SIMPLIFY_ANDS_QUERY: &str =
     "(expr
         (bin_expr
@@ -229,6 +186,25 @@ const SIMPLIFY_ANDS_QUERY: &str =
         )
         @binexpr
         (#eq? @lhs @rhs)
+    )";
+
+const SIMPLIFY_IMPLICATION_QUERY: &str =
+    "(expr
+        (bin_expr
+            lhs: (expr) @lhs
+            operator: \"==>\"
+        )
+        @binexpr
+        (#eq? @lhs \"false\")
+    )";
+
+const SIMPLIFY_TERNARY_QUERY: &str =
+    "(expr
+        (ternary_expr
+            else_expr: (expr) @else
+        )
+        @ternary_expr
+        (#eq? @else \"false\")
     )";
 
 const SIMPLIFY_IF_TRUE_QUERY: &str = "
@@ -255,74 +231,77 @@ const SIMPLIFY_GOTO_LABEL: &str = "
   )
 ";
 
+fn unused_label_replacements<'a>(
+    tree: &'a Tree,
+    source_str: &'a str
+) -> Vec<Replacement<'a>> {
+    let mut replacements = Vec::new();
+    let labels = get_labels(&tree, source_str);
+    for (node, label_text) in labels.iter() {
+        if !is_label_used(&tree, label_text, source_str) {
+            replacements.push(
+                Replacement {
+                    start: node.start_byte(),
+                    end: node.end_byte(),
+                    replacement: Cow::Borrowed("")
+                }
+            );
+        }
+    }
+    replacements
+}
+
+fn simplify_methods<'a>(
+    tree: &'a Tree,
+    source_str: &'a str
+) -> Vec<Replacement<'a>> {
+    let mut replacements = Vec::new();
+    let methods_query = viper_query("(method) @method");
+    let mut qc = QueryCursor::new();
+    qc.matches(&methods_query, tree.root_node(), source_str.as_bytes()).for_each(|m| {
+        let method = m.captures.iter().find(|c| c.index == 0).unwrap().node;
+        replacements.append(&mut constant_propagation(method, source_str));
+    });
+    replacements
+}
+
+fn remove_unused_decls<'a>(
+    tree: &'a Tree,
+    source_str: &'a str
+) -> Vec<Replacement<'a>> {
+    let mut replacements = Vec::new();
+    let decls_query = viper_query("(var_decl ident: (_) @ident) @decl");
+    let mut qc = QueryCursor::new();
+    qc.matches(&decls_query, tree.root_node(), source_str.as_bytes()).for_each(|m| {
+        let ident_text = get_captured_node_text(&decls_query, &m, "ident", source_str);
+        let decl = get_captured_node(&decls_query, &m, "decl");
+        if num_matches(tree.root_node(), &matching_ident_query(ident_text), source_str) == 1 {
+            replacements.push(Replacement {
+                start: decl.start_byte(),
+                end: decl.end_byte(),
+                replacement: Cow::Borrowed("")
+            });
+        }
+    });
+    replacements
+}
+
 fn main() {
 
-    // let source = "fn main() {
-    //     let a = 1;
-    //     let b = 2;
-    //     let c = 3;
-    // }";
-
-    // let query = "(
-    //     (let_declaration)* @bar
-    //     (let_declaration) @baz
-    // )";
-
-    // run_query(source, query);
-    // return;
-
-    // let tree = parse_viper_source(source);
-    // println!("{}", tree.root_node().to_sexp());
-    // return;
     let filename = env::args().nth(1).unwrap();
     let mut source = fs::read_to_string(filename).unwrap();
-    // let tree = parse_viper_source(&source);
-    // get_simplifiable_assigns(&tree, &source);
-    // return;
-
-    // let mut source = fs::read_to_string("../tree-sitter-viper/test.vpr").unwrap();
     let mut i = 0;
     loop {
         let mut buffer = String::new();
         let source_str = source.as_str();
         let tree = parse_viper_source(source_str);
-        let labels = get_labels(&tree, source_str);
-        eprintln!("Labels: {:?}", labels);
         let mut replacements = Vec::new();
-        for (node, label_text) in labels.iter() {
-            if !is_label_used(&tree, label_text, source_str) {
-                eprintln!("Unused label {}", label_text);
-                replacements.push(
-                    Replacement {
-                        start: node.start_byte(),
-                        end: node.end_byte(),
-                        replacement: Cow::Borrowed("")
-                    }
-                );
-            }
-        }
+        replacements.append(&mut unused_label_replacements(&tree, source_str));
         replacements.append(&mut get_simplifiable_assigns(&tree, source_str));
+        replacements.append(&mut simplify_methods(&tree, source_str));
+        replacements.append(&mut remove_unused_decls(&tree, source_str));
 
-        let methods_query = viper_query("(method) @method");
-        let mut qc = QueryCursor::new();
-        qc.matches(&methods_query, tree.root_node(), source_str.as_bytes()).for_each(|m| {
-            let method = m.captures.iter().find(|c| c.index == 0).unwrap().node;
-            replacements.append(&mut constant_propagation(method, source_str));
-        });
 
-        let decls_query = viper_query("(var_decl ident: (_) @ident) @decl");
-        let mut qc = QueryCursor::new();
-        qc.matches(&decls_query, tree.root_node(), source_str.as_bytes()).for_each(|m| {
-            let ident_text = get_captured_node_text(&decls_query, &m, "ident", source_str);
-            let decl = get_captured_node(&decls_query, &m, "decl");
-            if num_matches(tree.root_node(), &matching_ident_query(ident_text), source_str) == 1 {
-                replacements.push(Replacement {
-                    start: decl.start_byte(),
-                    end: decl.end_byte(),
-                    replacement: Cow::Borrowed("")
-                });
-            }
-        });
 
         replacements.append(&mut get_replacements_for(&tree, SIMPLIFY_GOTO_LABEL, source_str, |query, m| {
             let goto_stmt = get_captured_node(query, &m, "goto_stmt");
@@ -345,12 +324,32 @@ fn main() {
         }));
 
         replacements.append(&mut get_replacements_for(&tree, SIMPLIFY_ANDS_QUERY, source_str, |query, m| {
-            let if_clause = get_captured_node(query, &m, "binexpr");
+            let expr = get_captured_node(query, &m, "binexpr");
             let var = get_captured_node(query, &m, "lhs");
             Some(Replacement {
-                start: if_clause.start_byte(),
-                end: if_clause.end_byte(),
+                start: expr.start_byte(),
+                end: expr.end_byte(),
                 replacement: Cow::Borrowed(var.utf8_text(source_str.as_bytes()).unwrap())
+            })
+        }));
+
+        replacements.append(&mut get_replacements_for(&tree, SIMPLIFY_IMPLICATION_QUERY, source_str, |query, m| {
+            let implication = get_captured_node(query, &m, "binexpr");
+            Some(Replacement {
+                start: implication.start_byte(),
+                end: implication.end_byte(),
+                replacement: Cow::Borrowed("true")
+            })
+        }));
+
+        replacements.append(&mut get_replacements_for(&tree, SIMPLIFY_TERNARY_QUERY, source_str, |query, m| {
+            let texpr = get_captured_node(query, &m, "ternary_expr");
+            let condition = texpr.child_by_field_name("condition").unwrap();
+            let then_expr = texpr.child_by_field_name("then_expr").unwrap();
+            Some(Replacement {
+                start: texpr.start_byte(),
+                end: texpr.end_byte(),
+                replacement: Cow::Owned(format!("{} && {}", node_text(condition, source_str), node_text(then_expr, source_str)))
             })
         }));
 
@@ -378,6 +377,20 @@ fn main() {
             })
         }));
 
+        replacements.append(&mut get_replacements_for(&tree, "(old_expr) @expr", source_str, |query, m| {
+            let old_expr = get_captured_node(query, &m, "expr");
+            let inner = old_expr.child_by_field_name("expr").unwrap();
+            if inner.child(0).unwrap().kind() == "ident" {
+                Some(Replacement {
+                    start: old_expr.start_byte(),
+                    end: old_expr.end_byte(),
+                    replacement: Cow::Borrowed(node_text(inner, source_str))
+                })
+            } else {
+                None
+            }
+        }));
+
         sort_replacements(&mut replacements);
         let replacements = remove_overlapping_replacements(replacements);
         validate_replacements(&replacements);
@@ -396,6 +409,19 @@ fn main() {
         buffer.push_str(&source[last_byte..]);
         source = buffer.clone();
         i += 1
+    }
+    let string_replacements = vec![
+        ("f_erc20$$Erc20$$balance_of__$TY$__Snap$struct$m_erc20$$Erc20$$int$$$int$", "balance_of"),
+        ("snap$__$TY$__Snap$struct$m_erc20$$Erc20$struct$m_erc20$$Erc20$Snap$struct$m_erc20$$Erc20", "Erc20"),
+        ("snap$__$TY$__Snap$m_std$$result$$Result$_beg_$tuple0$$_sep_$m_erc20$$Error$_beg_$_end_$_end_$m_std$$result$$Result$_beg_$tuple0$$_sep_$m_erc20$$Error$_beg_$_end_$_end_$Snap$m_std$$result$$Result$_beg_$tuple0$$_sep_$m_erc20$$Error$_beg_$_end_$_end_", "Erc20Result"),
+        ("f_erc20$$Erc20$$allowance_impl__$TY$__Snap$struct$m_erc20$$Erc20$$int$$$int$$$int$", "allowance_of"),
+        ("cons$0$__$TY$__Snap$m_std$$result$$Result$_beg_$tuple0$$_sep_$m_erc20$$Error$_beg_$_end_$_end_$Snap$tuple0$$Snap$m_std$$result$$Result$_beg_$tuple0$$_sep_$m_erc20$$Error$_beg_$_end_$_end_", "mkResult"),
+        ("Snap$m_std$$result$$Result$_beg_$tuple0$$_sep_$m_erc20$$Error$_beg_$_end_$_end_", "SnapResult"),
+        ("f_erc20$$Erc20$$caller__$TY$__Snap$struct$m_erc20$$Erc20$$int$", "caller"),
+        ("erc20$$Money", "Money")
+    ];
+    for (from, to) in string_replacements {
+        source = source.replace(from, to);
     }
     println!("{}", source);
 }
@@ -503,13 +529,6 @@ fn get_replacements_for<'a, 'b: 'a, F>(
     matches.map(|m| {
         f(&query, m)
     }).filter(|r| r.is_some()).map(|r| r.unwrap()).collect()
-}
-
-fn parse_rust_source(source_code: &str) -> Tree {
-    let mut parser = Parser::new();
-    let language = tree_sitter_rust::language();
-    parser.set_language(language).unwrap();
-    parser.parse(source_code, None).unwrap()
 }
 
 fn parse_viper_source(source_code: &str) -> Tree {
