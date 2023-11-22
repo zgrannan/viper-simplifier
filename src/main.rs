@@ -49,7 +49,7 @@ fn get_body_of_braces<'a> (node: Node<'a>, source_str: &'a str) -> String {
     return buf
 }
 
-fn get_captured_node_text<'a>(query: &'a Query, m: &'a QueryMatch<'a, 'a>, name: &str, source_code: &'a str) -> &'a str {
+fn get_captured_node_text<'a, 'b>(query: &'a Query, m: &'a QueryMatch<'a, 'a>, name: &str, source_code: &'b str) -> &'b str {
     let node = get_captured_node(query, m, name);
     node_text(node, source_code)
 }
@@ -231,14 +231,28 @@ const SIMPLIFY_ANDS_QUERY: &str =
         (#eq? @lhs @rhs)
     )";
 
+const SIMPLIFY_IF_TRUE_QUERY: &str = "
+(
+    (stmt (if_stmt condition: (expr) @expr) @if)
+    (#eq? @expr \"true\")
+)";
 
-const SIMPLIFY_IFS_QUERY: &str = "
+const SIMPLIFY_SEQUENTIAL_IFS_QUERY: &str = "
     (
         (stmt (if_stmt condition: (expr (ident) @var1) then_clause: [(stmt (inhale_stmt (_)) ) (stmt (exhale_stmt (_)) ) ]*  !else_clause) @if1)
         .
         (stmt (if_stmt condition: (expr (ident) @var2) then_clause: [(stmt (inhale_stmt (_)) ) (stmt (exhale_stmt (_)) ) ]*  !else_clause) @if2)
         (#eq? @var1 @var2)
     )
+";
+
+const SIMPLIFY_GOTO_LABEL: &str = "
+  (
+    (stmt (goto_stmt target: (ident) @lbl) @goto_stmt)
+    .
+    (stmt (label (ident) @lbl2))
+    (#eq? @lbl @lbl2)
+  )
 ";
 
 fn main() {
@@ -296,6 +310,40 @@ fn main() {
             replacements.append(&mut constant_propagation(method, source_str));
         });
 
+        let decls_query = viper_query("(var_decl ident: (_) @ident) @decl");
+        let mut qc = QueryCursor::new();
+        qc.matches(&decls_query, tree.root_node(), source_str.as_bytes()).for_each(|m| {
+            let ident_text = get_captured_node_text(&decls_query, &m, "ident", source_str);
+            let decl = get_captured_node(&decls_query, &m, "decl");
+            if num_matches(tree.root_node(), &matching_ident_query(ident_text), source_str) == 1 {
+                replacements.push(Replacement {
+                    start: decl.start_byte(),
+                    end: decl.end_byte(),
+                    replacement: Cow::Borrowed("")
+                });
+            }
+        });
+
+        replacements.append(&mut get_replacements_for(&tree, SIMPLIFY_GOTO_LABEL, source_str, |query, m| {
+            let goto_stmt = get_captured_node(query, &m, "goto_stmt");
+            Some(Replacement {
+                start: goto_stmt.start_byte(),
+                end: goto_stmt.end_byte(),
+                replacement: Cow::Borrowed("")
+            })
+        }));
+
+        replacements.append(&mut get_replacements_for(&tree, SIMPLIFY_IF_TRUE_QUERY, source_str, |query, m| {
+            let if_stmt = get_captured_node(query, &m, "if");
+            let then_clause = node_text(if_stmt.child_by_field_name("then_clause").unwrap(), source_str);
+            eprintln!("Then clause: {}", then_clause);
+            Some(Replacement {
+                start: if_stmt.start_byte(),
+                end: if_stmt.end_byte(),
+                replacement: Cow::Borrowed(then_clause)
+            })
+        }));
+
         replacements.append(&mut get_replacements_for(&tree, SIMPLIFY_ANDS_QUERY, source_str, |query, m| {
             let if_clause = get_captured_node(query, &m, "binexpr");
             let var = get_captured_node(query, &m, "lhs");
@@ -306,7 +354,7 @@ fn main() {
             })
         }));
 
-        replacements.append(&mut get_replacements_for(&tree, SIMPLIFY_IFS_QUERY, source_str, |query, m| {
+        replacements.append(&mut get_replacements_for(&tree, SIMPLIFY_SEQUENTIAL_IFS_QUERY, source_str, |query, m| {
             let condition_node = get_captured_node(query, &m, "var1");
             let condition = condition_node.utf8_text(source_str.as_bytes()).unwrap();
             let second_condition = get_captured_node(query, &m, "var2").utf8_text(source_str.as_bytes()).unwrap();
@@ -417,6 +465,17 @@ fn has_matches<'a>(
         .matches(&query, node, source_code.as_bytes())
         .next()
         .is_some()
+}
+
+fn num_matches<'a>(
+    node: Node,
+    query: &'a Query,
+    source_code: &'a str
+) -> usize {
+    let mut query_cursor = QueryCursor::new();
+    query_cursor
+        .matches(&query, node, source_code.as_bytes())
+        .count()
 }
 
 fn is_label_used<'a>(
