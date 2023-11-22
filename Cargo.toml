@@ -9,6 +9,6 @@ edition = "2021"
 cc="*"
 
 [dependencies]
-# tree-sitter = "0.20.10"
-tree-sitter =  { path = "../tree-sitter/lib" }
-
+tree-sitter = "0.20.10"
+# tree-sitter =  { path = "../tree-sitter/lib" }
+tree-sitter-rust = "0.20.3"

@@ -1,4 +1,6 @@
 mod tree_sitter_viper;
+mod query_expr;
+use query_expr::*;
 use tree_sitter::Parser;
 use tree_sitter::Query;
 use tree_sitter::QueryCursor;
@@ -6,17 +8,28 @@ use tree_sitter::QueryMatch;
 use tree_sitter::Tree;
 use tree_sitter::Node;
 use std::fs;
-use std::fmt::Display;
 use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::collections::HashSet;
-use std::mem::replace;
+use std::env;
+use std::os::unix::ffi::OsStrExt;
 
 
 struct Replacement<'a> {
     start: usize,
     end: usize,
     replacement: Cow<'a, str>
+}
+
+impl <'a> Replacement<'a> {
+    fn new(start: usize, end: usize, replacement: Cow<'a, str>) -> Replacement<'a> {
+        assert!(start <= end);
+        Replacement {
+            start,
+            end,
+            replacement
+        }
+    }
 }
 
 fn get_body_of_braces<'a> (node: Node<'a>, source_str: &'a str) -> String {
@@ -32,14 +45,129 @@ fn get_body_of_braces<'a> (node: Node<'a>, source_str: &'a str) -> String {
     return buf
 }
 
+fn get_captured_node_text<'a>(query: &'a Query, m: &'a QueryMatch<'a, 'a>, name: &str, source_code: &'a str) -> &'a str {
+    let node = get_captured_node(query, m, name);
+    node_text(node, source_code)
+}
+
 fn get_captured_node<'a>(query: &'a Query, m: &'a QueryMatch<'a, 'a>, name: &str) -> Node<'a> {
+    get_captured_nodes(query, m, name)[0]
+}
+
+fn get_captured_node_with_text<'a>(query: &'a Query, m: &'a QueryMatch, name: &str, source_code: &'a str) -> (Node<'a>, &'a str) {
+    let node = get_captured_node(query, m, name);
+    (node, node_text(node, source_code))
+}
+
+fn get_captured_nodes<'a>(query: &'a Query, m: &'a QueryMatch<'a, 'a>, name: &str) -> Vec<Node<'a>> {
     let index = query.capture_index_for_name(name).unwrap();
-    // eprintln!("Index for {}: {}", name, index);
-    m.captures.iter().find(|c| c.index == index).unwrap().node
+    m.captures.iter().filter(|c| c.index == index).map(|c| c.node).collect::<Vec<_>>()
+}
+
+fn node_text<'a>(node: Node, source_code: &'a str) -> &'a str {
+    node.utf8_text(source_code.as_bytes()).unwrap()
+}
+
+fn is_constant<'a>(node: Node<'a>, source_code: &'a str) -> bool {
+    let text = node_text(node, source_code);
+    text == "true" || text == "false"
+}
+
+fn get_simplifiable_assigns<'a>(tree: &'a Tree, source_code: &'a str) -> Vec<Replacement<'a>> {
+    let mut replacements = Vec::new();
+    let mut qc = QueryCursor::new();
+    let decls_query = "(stmt (var_decl (ident) @ident (typ) @typ)) @decl";
+    let decls_ts_query = Query::new(tree.language(), decls_query).unwrap_or_else(|err|
+        panic!("Couldn't parse query: {}", err)
+    );
+    let matches = qc
+        .matches(&decls_ts_query, tree.root_node(), source_code.as_bytes());
+    for m in matches {
+        let decl = get_captured_node(&decls_ts_query, &m, "decl");
+        let ident_text = get_captured_node_text(&decls_ts_query, &m, "ident", source_code);
+        let typ_text = get_captured_node_text(&decls_ts_query, &m, "typ", source_code);
+        let mut next_sibling_option = decl.next_sibling();
+        let matching_ident_query = format!("((ident) @ident (#eq? @ident \"{}\"))", ident_text);
+        while next_sibling_option.is_some() {
+            let next_sibling = next_sibling_option.unwrap();
+            if has_matches(next_sibling, &matching_ident_query, source_code) {
+                if next_sibling.child(0).unwrap().kind() == "assign_stmt" {
+                    let assign_stmt = next_sibling.child(0).unwrap();
+                    let target = assign_stmt.child_by_field_name("target").unwrap();
+                    let expr = assign_stmt.child_by_field_name("expr").unwrap();
+                    if !is_constant(expr, source_code) {
+                        break;
+                    }
+                    let expr_text = node_text(expr, source_code);
+                    if node_text(target, source_code) == ident_text && !has_matches(expr, &matching_ident_query, source_code) {
+                        let rep1 = Replacement {
+                            start: decl.start_byte(),
+                            end: decl.end_byte(),
+                            replacement: Cow::Owned(format!("var {ident_text}: {typ_text} := {expr_text}"))
+                        };
+                        let rep2 = Replacement {
+                            start: assign_stmt.start_byte(),
+                            end: assign_stmt.end_byte(),
+                            replacement: Cow::Borrowed("")
+                        };
+                        replacements.push(rep1);
+                        replacements.push(rep2);
+                    }
+                }
+                break;
+            }
+            next_sibling_option = next_sibling.next_sibling();
+        }
+    }
+    return replacements
+}
+
+fn run_query(source: &str, query: &str) {
+    let tree = parse_rust_source(source);
+    let mut qc = QueryCursor::new();
+    let ts_query = Query::new(tree.language(), query).unwrap_or_else(|err|
+        panic!("Couldn't parse query: {}", err)
+    );
+    let matches = qc
+        .matches(&ts_query, tree.root_node(), source.as_bytes())
+        .collect::<Vec<_>>();
+    assert!(ts_query.pattern_count() == 1, "Expected one pattern");
+    for m in matches.iter() {
+        assert!(m.pattern_index == 0, "Expected pattern index to be 0");
+        eprintln!("----");
+        for capture in m.captures.iter() {
+            eprintln!("Capture {} for {}",
+                capture.node.utf8_text(source.as_bytes()).unwrap(),
+                ts_query.capture_names()[capture.index as usize]
+            );
+        }
+    }
 }
 
 fn main() {
-    let mut source = fs::read_to_string("./test.vpr").unwrap();
+
+    // let source = "fn main() {
+    //     let a = 1;
+    //     let b = 2;
+    //     let c = 3;
+    // }";
+
+    // let query = "(
+    //     (let_declaration)* @bar
+    //     (let_declaration) @baz
+    // )";
+
+    // run_query(source, query);
+    // return;
+
+    // let tree = parse_viper_source(source);
+    // println!("{}", tree.root_node().to_sexp());
+    // return;
+    let filename = env::args().nth(1).unwrap();
+    let mut source = fs::read_to_string(filename).unwrap();
+    // let tree = parse_viper_source(&source);
+    // get_simplifiable_assigns(&tree, &source);
+    // return;
 
     // let mut source = fs::read_to_string("../tree-sitter-viper/test.vpr").unwrap();
     let mut i = 0;
@@ -62,6 +190,7 @@ fn main() {
                 );
             }
         }
+        replacements.append(&mut get_simplifiable_assigns(&tree, source_str));
 
         replacements.append(&mut get_replacements_for(&tree, simplify_and(), source_str, |query, m| {
             let if_clause = get_captured_node(query, &m, "binexpr");
@@ -119,202 +248,9 @@ fn main() {
     println!("{}", source);
 }
 
-#[derive(Clone)]
-struct QueryMeta<'a> {
-    capture: Option<&'a str>,
-    predicate: Option<QueryPredicate<'a>>
-}
-
-impl <'a> QueryMeta<'a> {
-    fn empty() -> QueryMeta<'a> {
-        QueryMeta {
-            capture: None,
-            predicate: None
-        }
-    }
-    const fn capture(str: &'a str) -> QueryMeta<'a> {
-        QueryMeta {
-            capture: Some(str),
-            predicate: None
-        }
-    }
-
-    fn predicate(query_predicate: QueryPredicate<'a>) -> QueryMeta {
-        QueryMeta {
-            capture: None,
-            predicate: Some(query_predicate)
-        }
-    }
-}
-
-#[derive(Clone)]
-struct IfQueryExpr<'a> {
-    condition: Box<QueryExpr<'a>>,
-    then_clause: Box<QueryExpr<'a>>,
-    has_else: bool
-}
-
-#[derive(Clone)]
-struct BinOpQueryExpr<'a> {
-    lhs: Box<QueryExpr<'a>>,
-    operator: &'a str,
-    rhs: Box<QueryExpr<'a>>,
-}
-
-#[derive(Clone)]
-struct SeqQueryExpr<'a> {
-    fst: Box<QueryExpr<'a>>,
-    snd: Box<QueryExpr<'a>>,
-}
-
-#[derive(Clone)]
-enum QueryExpr<'a> {
-    BinExpr(BinOpQueryExpr<'a>, QueryMeta<'a>),
-    Braces(Box<Cow<'a, QueryExpr<'a>>>, QueryMeta<'a>),
-    Choice(Vec<Cow<'a, QueryExpr<'a>>>),
-    Comment,
-    Exhale(Box<QueryExpr<'a>>, QueryMeta<'a>),
-    Ident(QueryMeta<'a>),
-    IfStmt(IfQueryExpr<'a>, QueryMeta<'a>),
-    Inhale(Box<QueryExpr<'a>>, QueryMeta<'a>),
-    Parens(Box<Cow<'a, QueryExpr<'a>>>),
-    Seq(SeqQueryExpr<'a>, QueryMeta<'a>),
-    Star(Box<QueryExpr<'a>>, QueryMeta<'a>),
-    Wildcard,
-}
-
-#[derive(Clone)]
-enum PredicateExpr<'a> {
-    Capture(&'a str),
-    Literal(&'a str)
-}
-
-#[derive(Clone)]
-enum QueryPredicate<'a> {
-    Eq(PredicateExpr<'a>, PredicateExpr<'a>)
-}
-
-impl <'a> Display for PredicateExpr<'a> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            PredicateExpr::Capture(str) => write!(f, "@{}", str),
-            PredicateExpr::Literal(str) => write!(f, "\"{}\"", str),
-        }
-    }
-}
-
-impl <'a> Display for QueryPredicate<'a> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            QueryPredicate::Eq(lhs, rhs) => write!(f, "(#eq? {} {})", lhs, rhs),
-        }
-    }
-}
-
-impl <'a> Display for QueryMeta<'a> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if let Some(capture) = self.capture {
-            write!(f, "@{}", capture)?
-        };
-        if let Some(predicate) = &self.predicate {
-            write!(f, " {}", predicate)?
-        };
-        Ok(())
-    }
-
-}
-
-impl <'a> Display for QueryExpr<'a> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            QueryExpr::Braces(expr, meta) => write!(f, "(stmt {}) {}", expr, meta),
-            QueryExpr::Wildcard => write!(f, "(_)"),
-            QueryExpr::Comment => write!(f, "(comment)"),
-            QueryExpr::Inhale(expr, meta) =>
-                write!(f, "(stmt (inhale_stmt {}) {})", expr, meta),
-            QueryExpr::Exhale(expr, meta) =>
-                write!(f, "(stmt (exhale_stmt {}) {})", expr, meta),
-            QueryExpr::Star(expr, meta) =>
-                write!(f, "{}* {}", expr, meta),
-            QueryExpr::Seq(seq, meta) => {
-                write!(f, "({} {} {})", seq.fst, seq.snd, meta)
-            }
-            QueryExpr::Choice(choices) => {
-                write!(f, "[")?;
-                for choice in choices {
-                    write!(f, "{} ", choice)?;
-                }
-                write!(f, "]")
-            },
-            QueryExpr::Parens(expr) => write!(f, "(expr {})", expr),
-            QueryExpr::Ident(meta) => write!(f, "(expr (ident) {})", meta),
-            QueryExpr::IfStmt(if_query, meta) => write!(f,
-              "(stmt (if_stmt condition: {} then_clause: {} {}) {})",
-              if_query.condition,
-              if_query.then_clause,
-              if (if_query.has_else) {
-                ""
-              } else {
-                "!else_clause"
-              },
-              meta
-            ),
-            QueryExpr::BinExpr(bin_op, meta) => write!(f, "(expr
-                (bin_expr lhs: {} operator: \"{}\" rhs: {}) {}
-            )", bin_op.lhs, bin_op.operator, bin_op.rhs, meta),
-        }
-    }
-}
-
-impl <'a> QueryExpr<'a> {
-
-    fn star(expr: QueryExpr<'a>) -> QueryExpr<'a> {
-        QueryExpr::Star(Box::new(expr), QueryMeta::empty())
-    }
-
-    fn braces(expr: QueryExpr<'a>, meta: QueryMeta<'a>) -> QueryExpr<'a> {
-        QueryExpr::Braces(Box::new(Cow::Owned(expr)), meta)
-    }
-
-    fn maybe_in_parens(expr: &'a QueryExpr<'a>) -> QueryExpr<'a> {
-        QueryExpr::Choice(
-            vec![
-                Cow::Owned(QueryExpr::Parens(Box::new(Cow::Borrowed(expr)))),
-                Cow::Borrowed(expr),
-            ]
-        )
-    }
-
-    fn if_stmt(
-        condition: QueryExpr<'a>,
-        then_clause: QueryExpr<'a>,
-        has_else: bool,
-        meta: QueryMeta<'a>
-    ) -> QueryExpr<'a> {
-        QueryExpr::IfStmt(IfQueryExpr {
-            condition: Box::new(condition),
-            then_clause: Box::new(then_clause),
-            has_else
-        }, meta)
-    }
-
-    fn and(lhs: QueryExpr<'a>, rhs: QueryExpr<'a>, meta: QueryMeta<'a>) -> QueryExpr<'a> {
-        QueryExpr::BinExpr(BinOpQueryExpr {
-            operator: "&&",
-            lhs: Box::new(lhs),
-            rhs: Box::new(rhs)
-        }, meta)
-    }
-
-    const fn ident(capture: &'a str) -> QueryExpr<'a> {
-        QueryExpr::Ident(QueryMeta::capture(capture))
-    }
-}
-
 fn validate_replacements(replacements: &Vec<Replacement>) {
     replacements.iter().for_each(|r| {
-        assert!(r.start < r.end);
-        assert!(r.replacement.len() < r.end - r.start);
+        assert!(r.start <= r.end);
     });
     if replacements.len() >= 2 {
         let mut i = 0;
@@ -367,23 +303,30 @@ fn get_labels<'a>(
     }).collect()
 }
 
+fn has_matches<'a>(
+    node: Node,
+    query: &'a str,
+    source_code: &'a str
+) -> bool {
+    let mut query_cursor = QueryCursor::new();
+    let ts_query = Query::new(node.language(), query).unwrap_or_else(|err|
+        panic!("Couldn't parse query {}: {}", query, err)
+    );
+    let matches = query_cursor
+        .matches(&ts_query, node, source_code.as_bytes())
+        .collect::<Vec<_>>();
+    matches.len() > 0
+}
+
 fn is_label_used<'a>(
     tree: &'a Tree,
     label: &'a str,
     source_code: &'a str
 ) -> bool {
-    let mut query_cursor = QueryCursor::new();
     let query_string = format!("
         (goto_stmt target: (ident) @lbl (#eq? @lbl \"{label}\"))
         (old_expr label: (ident) @lbl (#eq? @lbl \"{label}\"))");
-    let ts_query = Query::new(tree.language(), query_string.as_str()).unwrap_or_else(|err|
-        panic!("Couldn't parse query {}: {}", query_string, err)
-    );
-    let matches = query_cursor
-        .matches(&ts_query, tree.root_node(), source_code.as_bytes())
-        .collect::<Vec<_>>();
-    eprintln!("Label {label} has {} matches", &matches.len());
-    matches.len() > 0
+    has_matches(tree.root_node(), &query_string, source_code)
 }
 
 fn get_replacements_for<'a, 'b: 'a, F>(
@@ -410,21 +353,21 @@ fn get_replacements_for<'a, 'b: 'a, F>(
 const RHS_IDENT: &'static QueryExpr<'static> = &QueryExpr::ident("rhs");
 
 fn simplify_ifs() -> QueryExpr<'static> {
-let side_effect_free_body =
-    QueryExpr::star(
-        QueryExpr::Choice(
-            vec![
-                Cow::Owned(QueryExpr::Inhale(
-                    Box::new(QueryExpr::Wildcard),
-                    QueryMeta::empty()
-                )),
-                Cow::Owned(QueryExpr::Exhale(
-                    Box::new(QueryExpr::Wildcard),
-                    QueryMeta::empty()
-                )),
-            ]
-        ),
-    );
+    let side_effect_free_body =
+        QueryExpr::star(
+            QueryExpr::Choice(
+                vec![
+                    Cow::Owned(QueryExpr::Inhale(
+                        Box::new(QueryExpr::Wildcard),
+                        QueryMeta::empty()
+                    )),
+                    Cow::Owned(QueryExpr::Exhale(
+                        Box::new(QueryExpr::Wildcard),
+                        QueryMeta::empty()
+                    )),
+                ]
+            ),
+        );
     QueryExpr::Seq(
         SeqQueryExpr {
             fst: Box::new(QueryExpr::if_stmt(
@@ -464,6 +407,13 @@ fn simplify_and() -> QueryExpr<'static> {
             ))
         }
     )
+}
+
+fn parse_rust_source(source_code: &str) -> Tree {
+    let mut parser = Parser::new();
+    let language = tree_sitter_rust::language();
+    parser.set_language(language).unwrap();
+    parser.parse(source_code, None).unwrap()
 }
 
 fn parse_viper_source(source_code: &str) -> Tree {
