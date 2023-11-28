@@ -1,6 +1,7 @@
 mod queries;
 mod tree_sitter_viper;
 mod string_substitutions;
+mod replacement;
 use tree_sitter::Parser;
 use tree_sitter::Query;
 use tree_sitter::QueryCursor;
@@ -14,14 +15,8 @@ use std::collections::VecDeque;
 use std::collections::HashSet;
 use std::env;
 use std::collections::HashMap;
-use std::mem::replace;
 use queries::*;
-
-struct Replacement<'a> {
-    start: usize,
-    end: usize,
-    replacement: Cow<'a, str>
-}
+use replacement::{Replacement, ReplacementGroup, to_replacements};
 
 fn get_body_of_braces<'a> (node: Node<'a>, source_str: &'a str) -> String {
     let mut buf = String::new();
@@ -189,13 +184,14 @@ fn get_decls_query() -> Query {
     viper_query("(stmt (var_decl (ident) @ident (typ) @typ)) @decl")
 }
 
-fn remove_variables_only_assigned_to_pure<'a, 'tree: 'a>(tree: &'tree Tree, source_code: &'a str) -> Vec<Replacement<'a>> {
-    let mut replacements = Vec::new();
+fn remove_variables_only_assigned_to_pure<'a, 'tree: 'a>(tree: &'tree Tree, source_code: &'a str) -> Vec<ReplacementGroup<'a>> {
+    let mut replacement_groups = Vec::new();
     let mut qc = QueryCursor::new();
     let decls_ts_query = get_decls_query();
     let matches = qc
         .matches(&decls_ts_query, tree.root_node(), source_code.as_bytes());
     for m in matches {
+        let mut replacements = Vec::new();
         let decl = get_captured_node(&decls_ts_query, &m, "decl");
         let decl_ident = get_captured_node(&decls_ts_query, &m, "ident");
         let ident_text = node_text(decl_ident, source_code);
@@ -231,10 +227,10 @@ fn remove_variables_only_assigned_to_pure<'a, 'tree: 'a>(tree: &'tree Tree, sour
                 );
                 replacements.append(&mut ident_replacements);
             }
-
         }
+        replacement_groups.push(ReplacementGroup::new(replacements))
     }
-    replacements
+    replacement_groups
 }
 
 fn get_simplifiable_assigns<'a>(tree: &'a Tree, source_code: &'a str) -> Vec<Replacement<'a>> {
@@ -349,15 +345,20 @@ fn main() {
         let mut buffer = String::new();
         let source_str = source.as_str();
         let tree = parse_viper_source(source_str);
-        let mut replacements = Vec::new();
-        replacements.append(&mut unused_label_replacements(&tree, source_str));
-        replacements.append(&mut get_simplifiable_assigns(&tree, source_str));
-        replacements.append(&mut simplify_methods(&tree, source_str));
-        replacements.append(&mut remove_unused_decls(&tree, source_str));
+        let mut replacement_groups = Vec::new();
+        let mut add_replacements = |replacements| {
+            for r in replacements {
+                replacement_groups.push(ReplacementGroup::new(vec![r]))
+            }
+        };
+        add_replacements(unused_label_replacements(&tree, source_str));
+        add_replacements(get_simplifiable_assigns(&tree, source_str));
+        add_replacements(simplify_methods(&tree, source_str));
+        add_replacements(remove_unused_decls(&tree, source_str));
 
 
 
-        replacements.append(&mut get_replacements_for(&tree, SIMPLIFY_GOTO_LABEL, source_str, |query, m| {
+        add_replacements(get_replacements_for(&tree, SIMPLIFY_GOTO_LABEL, source_str, |query, m| {
             let goto_stmt = get_captured_node(query, &m, "goto_stmt");
             Some(Replacement {
                 start: goto_stmt.start_byte(),
@@ -366,7 +367,7 @@ fn main() {
             })
         }));
 
-        replacements.append(&mut get_replacements_for(&tree, SIMPLIFY_IF_TRUE_QUERY, source_str, |query, m| {
+        add_replacements(get_replacements_for(&tree, SIMPLIFY_IF_TRUE_QUERY, source_str, |query, m| {
             let if_stmt = get_captured_node(query, &m, "if");
             let then_clause = node_text(if_stmt.child_by_field_name("then_clause").unwrap(), source_str);
             eprintln!("Then clause: {}", then_clause);
@@ -377,7 +378,7 @@ fn main() {
             })
         }));
 
-        replacements.append(&mut get_replacements_for(&tree, SIMPLIFY_ANDS_QUERY, source_str, |query, m| {
+        add_replacements(get_replacements_for(&tree, SIMPLIFY_ANDS_QUERY, source_str, |query, m| {
             let expr = get_captured_node(query, &m, "binexpr");
             let var = get_captured_node(query, &m, "lhs");
             Some(Replacement {
@@ -387,7 +388,7 @@ fn main() {
             })
         }));
 
-        replacements.append(&mut get_replacements_for(&tree, SIMPLIFY_IMPLICATION_QUERY, source_str, |query, m| {
+        add_replacements(get_replacements_for(&tree, SIMPLIFY_IMPLICATION_QUERY, source_str, |query, m| {
             let implication = get_captured_node(query, &m, "binexpr");
             Some(Replacement {
                 start: implication.start_byte(),
@@ -396,7 +397,7 @@ fn main() {
             })
         }));
 
-        replacements.append(&mut get_replacements_for(&tree, SIMPLIFY_TERNARY_QUERY, source_str, |query, m| {
+        add_replacements(get_replacements_for(&tree, SIMPLIFY_TERNARY_QUERY, source_str, |query, m| {
             let texpr = get_captured_node(query, &m, "ternary_expr");
             let condition = texpr.child_by_field_name("condition").unwrap();
             let then_expr = texpr.child_by_field_name("then_expr").unwrap();
@@ -407,7 +408,7 @@ fn main() {
             })
         }));
 
-        replacements.append(&mut get_replacements_for(&tree, SIMPLIFY_TERNARY_QUERY2, source_str, |query, m| {
+        add_replacements(get_replacements_for(&tree, SIMPLIFY_TERNARY_QUERY2, source_str, |query, m| {
             let texpr = get_captured_node(query, &m, "ternary_expr");
             let condition = texpr.child_by_field_name("condition").unwrap();
             let then_expr = texpr.child_by_field_name("then_expr").unwrap();
@@ -418,7 +419,7 @@ fn main() {
             })
         }));
 
-        replacements.append(&mut get_replacements_for(&tree, SIMPLIFY_SEQUENTIAL_IFS_QUERY, source_str, |query, m| {
+        add_replacements(get_replacements_for(&tree, SIMPLIFY_SEQUENTIAL_IFS_QUERY, source_str, |query, m| {
             let condition_node = get_captured_node(query, &m, "var1");
             let condition = condition_node.utf8_text(source_str.as_bytes()).unwrap();
             let second_condition = get_captured_node(query, &m, "var2").utf8_text(source_str.as_bytes()).unwrap();
@@ -442,7 +443,7 @@ fn main() {
             })
         }));
 
-        replacements.append(&mut get_replacements_for(&tree, "(old_expr) @expr", source_str, |query, m| {
+        add_replacements(get_replacements_for(&tree, "(old_expr) @expr", source_str, |query, m| {
             let old_expr = get_captured_node(query, &m, "expr");
             let inner = old_expr.child_by_field_name("expr").unwrap();
             if inner.child(0).unwrap().kind() == "ident" {
@@ -456,11 +457,9 @@ fn main() {
             }
         }));
 
-        replacements.append(&mut remove_variables_only_assigned_to_pure(&tree, source_str));
+        replacement_groups.append(&mut remove_variables_only_assigned_to_pure(&tree, source_str));
 
-        sort_replacements(&mut replacements);
-        let replacements = remove_overlapping_replacements(replacements);
-        validate_replacements(&replacements);
+        let replacements = to_replacements(replacement_groups);
         let mut last_byte = 0;
         eprintln!("Iteration {i} (code size: {}): Made {} replacements", source_str.len(), replacements.len());
         for node in replacements {
@@ -481,18 +480,6 @@ fn main() {
 }
 
 
-fn validate_replacements(replacements: &Vec<Replacement>) {
-    replacements.iter().for_each(|r| {
-        assert!(r.start <= r.end);
-    });
-    if replacements.len() >= 2 {
-        let mut i = 0;
-        while i < replacements.len() - 1 {
-            assert!(replacements[i].end <= replacements[i + 1].start);
-            i += 1;
-        }
-    };
-}
 
 fn remove_overlapping_replacements(mut input: Vec<Replacement>) -> Vec<Replacement> {
     if input.len() < 2  {
@@ -508,15 +495,6 @@ fn remove_overlapping_replacements(mut input: Vec<Replacement>) -> Vec<Replaceme
         }
     }
     deque.into()
-}
-
-fn sort_replacements(replacements: &mut Vec<Replacement>) {
-    if replacements.len() < 2  {
-        return;
-    }
-    replacements.sort_by(|a, b| {
-        a.start.cmp(&b.start)
-    });
 }
 
 fn get_labels<'a>(
