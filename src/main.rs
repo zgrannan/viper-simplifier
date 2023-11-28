@@ -12,6 +12,7 @@ use std::collections::HashSet;
 use std::env;
 use std::collections::HashMap;
 use std::mem::replace;
+use regex::Regex;
 
 
 struct Replacement<'a> {
@@ -206,6 +207,14 @@ const SIMPLIFY_TERNARY_QUERY: &str =
         @ternary_expr
         (#eq? @else \"false\")
     )";
+const SIMPLIFY_TERNARY_QUERY2: &str =
+"(expr
+    (ternary_expr
+        else_expr: (expr) @else
+    )
+    @ternary_expr
+    (#eq? @else \"true\")
+)";
 
 const SIMPLIFY_IF_TRUE_QUERY: &str = "
 (
@@ -353,6 +362,17 @@ fn main() {
             })
         }));
 
+        replacements.append(&mut get_replacements_for(&tree, SIMPLIFY_TERNARY_QUERY2, source_str, |query, m| {
+            let texpr = get_captured_node(query, &m, "ternary_expr");
+            let condition = texpr.child_by_field_name("condition").unwrap();
+            let then_expr = texpr.child_by_field_name("then_expr").unwrap();
+            Some(Replacement {
+                start: texpr.start_byte(),
+                end: texpr.end_byte(),
+                replacement: Cow::Owned(format!("{} ==> {}", node_text(condition, source_str), node_text(then_expr, source_str)))
+            })
+        }));
+
         replacements.append(&mut get_replacements_for(&tree, SIMPLIFY_SEQUENTIAL_IFS_QUERY, source_str, |query, m| {
             let condition_node = get_captured_node(query, &m, "var1");
             let condition = condition_node.utf8_text(source_str.as_bytes()).unwrap();
@@ -411,6 +431,7 @@ fn main() {
         i += 1
     }
     let string_replacements = vec![
+        ("requires true\n", ""),
         ("f_erc20$$Erc20$$balance_of__$TY$__Snap$struct$m_erc20$$Erc20$$int$$$int$", "balance_of"),
         ("snap$__$TY$__Snap$struct$m_erc20$$Erc20$struct$m_erc20$$Erc20$Snap$struct$m_erc20$$Erc20", "Erc20"),
         ("snap$__$TY$__Snap$m_std$$result$$Result$_beg_$tuple0$$_sep_$m_erc20$$Error$_beg_$_end_$_end_$m_std$$result$$Result$_beg_$tuple0$$_sep_$m_erc20$$Error$_beg_$_end_$_end_$Snap$m_std$$result$$Result$_beg_$tuple0$$_sep_$m_erc20$$Error$_beg_$_end_$_end_", "Erc20Result"),
@@ -423,6 +444,19 @@ fn main() {
     for (from, to) in string_replacements {
         source = source.replace(from, to);
     }
+    let delete_patterns = vec![
+        r"// \[mir\].*",
+        r"// drop (Acc|Pred).*"
+    ];
+
+    for delete_pattern in delete_patterns {
+        let regex = Regex::new(delete_pattern).unwrap();
+        source = source.lines()
+                    .filter(|line| !regex.is_match(line))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+    }
+
     println!("{}", source);
 }
 

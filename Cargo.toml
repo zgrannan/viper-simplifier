@@ -9,6 +9,7 @@ edition = "2021"
 cc="*"
 
 [dependencies]
+regex = "1"
 tree-sitter = "0.20.10"
 # tree-sitter =  { path = "../tree-sitter/lib" }
 tree-sitter-rust = "0.20.3"

@@ -86,6 +86,7 @@ name = "viper-simplifier"
 version = "0.1.0"
 dependencies = [
  "cc",
+ "regex",
  "tree-sitter",
  "tree-sitter-rust",
 ]
