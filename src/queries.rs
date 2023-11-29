@@ -19,6 +19,17 @@ pub const SIMPLIFY_IMPLICATION_QUERY: &str =
         (#eq? @lhs \"false\")
     )";
 
+pub const SIMPLIFY_EQUALS_QUERY: &str =
+    "(expr
+        (bin_expr
+            lhs: (expr) @lhs
+            operator: \"==\"
+            rhs: (expr) @rhs
+        )
+        @binexpr
+        (#eq? @lhs @rhs)
+    )";
+
 pub const SIMPLIFY_TERNARY_QUERY: &str =
     "(expr
         (ternary_expr

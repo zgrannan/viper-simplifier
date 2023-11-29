@@ -1,8 +1,22 @@
+use tree_sitter::Node;
 use std::borrow::Cow;
 pub struct Replacement<'a> {
     pub start: usize,
     pub end: usize,
     pub replacement: Cow<'a, str>
+}
+
+impl <'a> Replacement<'a> {
+    pub fn erase(node: Node<'a>) -> Self {
+        Self::new(node, Cow::Borrowed(""))
+    }
+    pub fn new<'tree>(node: Node<'tree>, replacement: Cow<'a, str>) -> Self {
+        Replacement {
+            start: node.start_byte(),
+            end: node.end_byte(),
+            replacement
+        }
+    }
 }
 
 pub struct ReplacementGroup<'a> {
